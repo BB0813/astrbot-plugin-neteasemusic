@@ -130,13 +130,18 @@ class Main(star.Star):
 
     # --- Event Handlers ---
 
-    @filter.command("点歌", alias={"music", "听歌", "网易云"})
+    @filter.command("点歌", alias={"music", "听歌", "网易云"}, priority=1)
     async def cmd_handler(self, event: AstrMessageEvent, keyword: str = ""):
         """Handles the '/点歌' command."""
-        if not keyword.strip():
+        # The command text overlaps with the natural-language regex below. Consume
+        # the event here so one user request cannot produce two search result lists.
+        event.stop_event()
+
+        keyword = keyword.strip()
+        if not keyword:
             await event.send(MessageChain([Plain("主人，请告诉我您想听什么歌喵~ 例如：/点歌 Lemon")]))
             return
-        await self.search_and_show(event, keyword.strip())
+        await self.search_and_show(event, keyword)
 
     @filter.regex(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$")
     async def natural_language_handler(self, event: AstrMessageEvent):
@@ -145,6 +150,7 @@ class Main(star.Star):
         if match:
             keyword = match.group(2).strip()
             if keyword:
+                event.stop_event()
                 await self.search_and_show(event, keyword)
 
     @filter.regex(r"^\d+$", priority=999)
