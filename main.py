@@ -5,12 +5,14 @@ Netease Music Enhanced Plugin for AstrBot
 - Features: Interactive song selection, cover display, audio playback, and auto quality fallback.
 """
 
+import os
 import re
 import time
 import base64
 import aiohttp
 import asyncio
 import shutil
+import subprocess
 import urllib.parse
 from typing import Dict, Any, Optional, List
 
@@ -18,6 +20,50 @@ from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain, Image, Record
+
+
+# --- Helpers ---
+def _find_ffmpeg() -> Optional[str]:
+    """
+    Try to locate the ffmpeg executable.
+    Returns the absolute path or None.
+    """
+    # 1. Standard PATH lookup
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+
+    # 2. Common Windows install locations
+    candidates = [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Users\Administrator\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Windows\ffmpeg\bin\ffmpeg.exe",
+    ]
+    # Also try the current working directory / project root
+    candidates.append(os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"))
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 3. Fallback: try subprocess to resolve via the shell
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            # It worked; the binary is somewhere in the system PATH
+            # but not visible to shutil.which in this context.
+            # Return "ffmpeg" so that subsequent subprocess calls still work
+            return "ffmpeg"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return None
 
 
 # --- API Wrapper ---
@@ -89,6 +135,17 @@ class Main(star.Star):
         
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.api = NeteaseMusicAPI(self.config["api_url"], self.http_session)
+        
+        # Ensure ffmpeg is discoverable for Record components
+        self._ffmpeg_path = _find_ffmpeg()
+        if self._ffmpeg_path:
+            ffmpeg_dir = os.path.dirname(self._ffmpeg_path)
+            current_path = os.environ.get("PATH", "")
+            if ffmpeg_dir not in current_path:
+                os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
+                logger.info(f"Netease Music plugin: Added ffmpeg directory to PATH: {ffmpeg_dir}")
+        else:
+            logger.warning("Netease Music plugin: ffmpeg not found in PATH. Record (voice) may fail.")
         
         self.cleanup_task: Optional[asyncio.Task] = None
 
@@ -269,8 +326,14 @@ class Main(star.Star):
 
         await event.send(MessageChain(info_components))
         
-        if shutil.which("ffmpeg") is not None:
+        # Try to send as a voice message (Record component)
+        try:
             await event.send(MessageChain([Record(file=audio_url)]))
-        else:
-            logger.warning("Netease Music plugin: ffmpeg 不可用，跳过发送语音，改为发送音频链接。")
-            await event.send(MessageChain([Plain(f"🔊 音频链接：{audio_url}\n（服务器未安装 ffmpeg，无法发送语音消息）")]))
+        except Exception as e:
+            err_msg = str(e)
+            if "ffmpeg" in err_msg.lower() or "not found" in err_msg.lower():
+                # Fallback if ffmpeg is still unavailable after PATH fix attempt
+                logger.warning(f"Netease Music plugin: Record(voice) failed, falling back to link. Error: {err_msg}")
+                await event.send(MessageChain([Plain(f"🔊 点击播放：{audio_url}")]))
+            else:
+                raise
