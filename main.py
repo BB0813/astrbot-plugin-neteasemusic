@@ -80,9 +80,14 @@ class Main(star.Star):
         self.config.setdefault("api_url", "http://127.0.0.1:3000")
         self.config.setdefault("quality", "exhigh")
         self.config.setdefault("search_limit", 5)
+        self.config.setdefault("wait_timeout", 60)
+        self.config.setdefault("send_cover", True)
+        self.config.setdefault("enable_natural_language", True)
+        self.config.setdefault("audio_send_mode", "voice")
         
         self.waiting_users: Dict[str, Dict[str, Any]] = {}
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._last_search: Dict[str, Any] = {}  # session_id -> (keyword, timestamp) 去重用
         
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.api = NeteaseMusicAPI(self.config["api_url"], self.http_session)
@@ -128,6 +133,11 @@ class Main(star.Star):
                     if cache_key in self.song_cache:
                         del self.song_cache[cache_key]
 
+            # 清理过期的搜索去重记录（超过 60 秒）
+            stale_search = [sid for sid, (_, ts) in self._last_search.items() if now - ts > 60]
+            for sid in stale_search:
+                del self._last_search[sid]
+
     # --- Event Handlers ---
 
     @filter.command("点歌", alias={"music", "听歌", "网易云"}, priority=1)
@@ -146,6 +156,8 @@ class Main(star.Star):
     @filter.regex(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$")
     async def natural_language_handler(self, event: AstrMessageEvent):
         """Handles song requests in natural language."""
+        if not self.config.get("enable_natural_language", True):
+            return
         match = re.search(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$", event.message_str)
         if match:
             keyword = match.group(2).strip()
@@ -175,15 +187,27 @@ class Main(star.Star):
             return
 
         event.stop_event()
+
+        # Fix: 先清掉 waiting_users，防止平台重试/重复事件导致重复发消息
+        del self.waiting_users[session_id]
+
         await self.play_selected_song(event, user_session["key"], num)
-        
-        if session_id in self.waiting_users:
-            del self.waiting_users[session_id]
 
     # --- Core Logic ---
 
     async def search_and_show(self, event: AstrMessageEvent, keyword: str):
         """Searches for songs and displays the results to the user."""
+        session_id = event.get_session_id()
+        now = time.time()
+
+        # 去重：同一 session 同一关键词 3 秒内不重复处理，防止平台重试导致发两遍
+        if session_id in self._last_search:
+            last_keyword, last_time = self._last_search[session_id]
+            if last_keyword == keyword and now - last_time < 3:
+                logger.info(f"Netease Music plugin: 跳过重复搜索 '{keyword}' (session {session_id})")
+                return
+        self._last_search[session_id] = (keyword, now)
+
         try:
             songs = await self.api.search_songs(keyword, self.config["search_limit"])
         except Exception as e:
@@ -208,7 +232,8 @@ class Main(star.Star):
 
         await event.send(MessageChain([Plain("\n".join(response_lines))]))
 
-        self.waiting_users[event.get_session_id()] = {"key": cache_key, "expire": time.time() + 60}
+        wait_timeout = self.config.get("wait_timeout", 60)
+        self.waiting_users[event.get_session_id()] = {"key": cache_key, "expire": time.time() + wait_timeout}
 
     async def play_selected_song(self, event: AstrMessageEvent, cache_key: str, num: int):
         """Plays the song selected by the user."""
@@ -264,9 +289,15 @@ class Main(star.Star):
 """
         info_components = [Plain(detail_text)]
 
-        image_data = await self.api.download_image(cover_url)
-        if image_data:
-            info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
+        if self.config.get("send_cover", True):
+            image_data = await self.api.download_image(cover_url)
+            if image_data:
+                info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
 
         await event.send(MessageChain(info_components))
-        await event.send(MessageChain([Record(file=audio_url)]))
+
+        mode = self.config.get("audio_send_mode", "voice")
+        if mode in ("voice", "both"):
+            await event.send(MessageChain([Record(file=audio_url)]))
+        if mode in ("url", "both"):
+            await event.send(MessageChain([Plain(f"🔗 音频链接：{audio_url}")]))

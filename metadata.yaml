@@ -4,6 +4,6 @@ desc: "AstrBot 豪华网易云点歌插件\n\n这是一款为 AstrBot 设计的�
 author: "NachoCrazy"
 repo: "https://github.com/NachoCrazy/netease-music-astrbot-plugin"
 social_link: "https://github.com/NachoCrazy"
-version: "1.2.0"
+version: "2.0.0"
 logo: "https://s2.loli.net/2022/04/11/gO1t56sM4pQeYyH.png"
 config: true

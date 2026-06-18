@@ -1,13 +1,13 @@
 {
   "api_url": {
     "type": "string",
-    "label": "网易云API地址",
-    "description": "您自行部署的 NeteaseCloudMusicApi 服务地址，例如：http://127.0.0.1:3000",
+    "label": "网易云 API 地址",
+    "description": "自行部署的 NeteaseCloudMusicApi 服务地址，例如：http://127.0.0.1:3000",
     "default": "http://127.0.0.1:3000"
   },
   "quality": {
     "type": "string",
-    "label": "默认音质",
+    "label": "优先音质",
     "description": "优先获取的音质。如果不可用，插件会自动尝试更低的音质。",
     "default": "exhigh",
     "options": [
@@ -20,7 +20,40 @@
   "search_limit": {
     "type": "int",
     "label": "搜索结果数量",
-    "description": "每次搜索时，向用户展示的歌曲选项数量。",
-    "default": 5
+    "description": "每次搜索时，向用户展示的歌曲选项数量（1-20）。",
+    "default": 5,
+    "min": 1,
+    "max": 20
+  },
+  "wait_timeout": {
+    "type": "int",
+    "label": "选歌等待时长（秒）",
+    "description": "用户看到搜索结果后，有多少秒时间可以回复数字选歌。超时后会话自动清理。",
+    "default": 60,
+    "min": 10,
+    "max": 300
+  },
+  "send_cover": {
+    "type": "boolean",
+    "label": "发送封面图",
+    "description": "播放歌曲时是否附带专辑封面图。关闭可加快发送速度，部分平台对图片支持不佳时可关闭。",
+    "default": true
+  },
+  "enable_natural_language": {
+    "type": "boolean",
+    "label": "启用自然语言点歌",
+    "description": "开启后，用户可以直接说「来一首xxx」、「播放xxx」等自然语言触发点歌。关闭后仅支持 /点歌 命令。",
+    "default": true
+  },
+  "audio_send_mode": {
+    "type": "string",
+    "label": "音频发送方式",
+    "description": "voice：发送语音消息（可直接播放）；url：只发送音频链接；both：同时发送语音和链接。",
+    "default": "voice",
+    "options": [
+      "voice",
+      "url",
+      "both"
+    ]
   }
 }
