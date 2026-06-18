@@ -10,6 +10,7 @@ import time
 import base64
 import aiohttp
 import asyncio
+import shutil
 import urllib.parse
 from typing import Dict, Any, Optional, List
 
@@ -17,6 +18,7 @@ from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain, Image, Record
+
 
 # --- API Wrapper ---
 class NeteaseMusicAPI:
@@ -68,6 +70,7 @@ class NeteaseMusicAPI:
                 return await r.read()
         return None
 
+
 # --- Main Plugin Class ---
 class Main(star.Star):
     """
@@ -80,14 +83,9 @@ class Main(star.Star):
         self.config.setdefault("api_url", "http://127.0.0.1:3000")
         self.config.setdefault("quality", "exhigh")
         self.config.setdefault("search_limit", 5)
-        self.config.setdefault("wait_timeout", 60)
-        self.config.setdefault("send_cover", True)
-        self.config.setdefault("enable_natural_language", True)
-        self.config.setdefault("audio_send_mode", "voice")
         
         self.waiting_users: Dict[str, Dict[str, Any]] = {}
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
-        self._last_search: Dict[str, Any] = {}  # session_id -> (keyword, timestamp) 去重用
         
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.api = NeteaseMusicAPI(self.config["api_url"], self.http_session)
@@ -133,31 +131,19 @@ class Main(star.Star):
                     if cache_key in self.song_cache:
                         del self.song_cache[cache_key]
 
-            # 清理过期的搜索去重记录（超过 60 秒）
-            stale_search = [sid for sid, (_, ts) in self._last_search.items() if now - ts > 60]
-            for sid in stale_search:
-                del self._last_search[sid]
-
     # --- Event Handlers ---
 
-    @filter.command("点歌", alias={"music", "听歌", "网易云"}, priority=1)
+    @filter.command("点歌", alias={"music", "听歌", "网易云"})
     async def cmd_handler(self, event: AstrMessageEvent, keyword: str = ""):
         """Handles the '/点歌' command."""
-        # The command text overlaps with the natural-language regex below. Consume
-        # the event here so one user request cannot produce two search result lists.
-        event.stop_event()
-
-        keyword = keyword.strip()
-        if not keyword:
+        if not keyword.strip():
             await event.send(MessageChain([Plain("主人，请告诉我您想听什么歌喵~ 例如：/点歌 Lemon")]))
             return
-        await self.search_and_show(event, keyword)
+        await self.search_and_show(event, keyword.strip())
 
     @filter.regex(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$")
     async def natural_language_handler(self, event: AstrMessageEvent):
         """Handles song requests in natural language."""
-        if not self.config.get("enable_natural_language", True):
-            return
         match = re.search(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$", event.message_str)
         if match:
             keyword = match.group(2).strip()
@@ -197,17 +183,6 @@ class Main(star.Star):
 
     async def search_and_show(self, event: AstrMessageEvent, keyword: str):
         """Searches for songs and displays the results to the user."""
-        session_id = event.get_session_id()
-        now = time.time()
-
-        # 去重：同一 session 同一关键词 3 秒内不重复处理，防止平台重试导致发两遍
-        if session_id in self._last_search:
-            last_keyword, last_time = self._last_search[session_id]
-            if last_keyword == keyword and now - last_time < 3:
-                logger.info(f"Netease Music plugin: 跳过重复搜索 '{keyword}' (session {session_id})")
-                return
-        self._last_search[session_id] = (keyword, now)
-
         try:
             songs = await self.api.search_songs(keyword, self.config["search_limit"])
         except Exception as e:
@@ -232,8 +207,7 @@ class Main(star.Star):
 
         await event.send(MessageChain([Plain("\n".join(response_lines))]))
 
-        wait_timeout = self.config.get("wait_timeout", 60)
-        self.waiting_users[event.get_session_id()] = {"key": cache_key, "expire": time.time() + wait_timeout}
+        self.waiting_users[event.get_session_id()] = {"key": cache_key, "expire": time.time() + 60}
 
     async def play_selected_song(self, event: AstrMessageEvent, cache_key: str, num: int):
         """Plays the song selected by the user."""
@@ -289,15 +263,14 @@ class Main(star.Star):
 """
         info_components = [Plain(detail_text)]
 
-        if self.config.get("send_cover", True):
-            image_data = await self.api.download_image(cover_url)
-            if image_data:
-                info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
+        image_data = await self.api.download_image(cover_url)
+        if image_data:
+            info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
 
         await event.send(MessageChain(info_components))
-
-        mode = self.config.get("audio_send_mode", "voice")
-        if mode in ("voice", "both"):
+        
+        if shutil.which("ffmpeg") is not None:
             await event.send(MessageChain([Record(file=audio_url)]))
-        if mode in ("url", "both"):
-            await event.send(MessageChain([Plain(f"🔗 音频链接：{audio_url}")]))
+        else:
+            logger.warning("Netease Music plugin: ffmpeg 不可用，跳过发送语音，改为发送音频链接。")
+            await event.send(MessageChain([Plain(f"🔊 音频链接：{audio_url}\n（服务器未安装 ffmpeg，无法发送语音消息）")]))
