@@ -93,21 +93,25 @@ class NeteaseMusicAPI:
             return data["songs"][0] if data.get("songs") else None
 
     # 此处增加了 cookie 参数，但默认值为空，不影响原逻辑
-    async def get_audio_url(self, song_id: int, quality: str, cookie: str = "") -> Optional[str]:
+    async def get_audio_url(self, song_id: int, quality: str) -> Optional[str]:
         """
-        Get the audio stream URL for a song with automatic quality fallback.
+        Get the audio stream URL for a song using Netease-CDN-Bypass /song/proxy.
+        This is the recommended playback endpoint.
         """
-        qualities_to_try = list(dict.fromkeys([quality, "exhigh", "higher", "standard"]))
-        for q in qualities_to_try:
-            # 核心修改：在 URL 中拼接 cookie
-            url = f"{self.base_url}/song/url/v1?id={str(song_id)}&level={q}&cookie={cookie}"
-            async with self.session.get(url) as r:
-                r.raise_for_status()
-                data = await r.json()
-                audio_info = data.get("data", [{}])[0]
-                if audio_info.get("url"):
-                    return audio_info["url"]
-        return None
+        br = self._quality_to_br(quality)
+        # /song/proxy streams the audio directly (bypasses hotlink protection)
+        url = f"{self.base_url}/song/proxy?id={song_id}&br={br}"
+        return url
+
+    def _quality_display(self, quality: str) -> str:
+        """Convert quality code to Chinese display name"""
+        mapping = {
+            "lossless": "无损",
+            "exhigh": "极高",
+            "higher": "高",
+            "standard": "标准",
+        }
+        return mapping.get(quality.lower(), quality)
 
     async def download_image(self, url: str) -> Optional[bytes]:
         """Download image data from a URL."""
@@ -130,9 +134,7 @@ class Main(star.Star):
         self.config = config or {}
         self.config.setdefault("api_url", "http://127.0.0.1:3000")
         self.config.setdefault("quality", "exhigh")
-        self.config.setdefault("search_limit", 5)
-        # 仅新增这一行配置初始化
-        self.config.setdefault("cookie", "")
+        # cookie 配置已移除，不再需要
         
         self.waiting_users: Dict[str, Dict[str, Any]] = {}
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -245,7 +247,7 @@ class Main(star.Star):
     async def search_and_show(self, event: AstrMessageEvent, keyword: str):
         """Searches for songs and displays the results to the user."""
         try:
-            songs = await self.api.search_songs(keyword, self.config["search_limit"])
+            songs = await self.api.search_songs(keyword, self.config.get("search_limit", 5))
         except Exception as e:
             logger.error(f"Netease Music plugin: API search failed. Error: {e!s}")
             await event.send(MessageChain([Plain(f"呜喵...和音乐服务器的连接断掉了...主人，请检查一下API服务是否正常运行喵？")]))
@@ -285,12 +287,12 @@ class Main(star.Star):
         song_id = selected_song["id"]
         
         try:
+            # Use Netease-CDN-Bypass /song/proxy endpoint (streams audio directly)
             song_details = await self.api.get_song_details(song_id)
             if not song_details:
                 raise ValueError("无法获取歌曲详细信息。")
 
-            # 核心修改：在此处传入配置中的 cookie
-            audio_url = await self.api.get_audio_url(song_id, self.config["quality"], self.config.get("cookie", ""))
+            audio_url = await self.api.get_audio_url(song_id, self.config["quality"])
             if not audio_url:
                 await event.send(MessageChain([Plain(f"喵~ 这首歌可能需要VIP或者没有版权，暂时不能为主人播放呢...")]))
                 return
@@ -319,7 +321,7 @@ class Main(star.Star):
 🎤 歌手：{artists}
 💿 专辑：{album}
 ⏳ 时长：{dur_str}
-✨ 音质：{self.config['quality']}
+✨ 音质：{self._quality_display(self.config['quality'])}
 
 请主人享用喵~
 """
