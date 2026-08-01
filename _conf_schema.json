@@ -2,14 +2,20 @@
   "api_url": {
     "type": "string",
     "label": "API 地址",
-    "description": "Netease-CDN-Bypass 服务地址（默认：http://127.0.0.1:3000）",
-    "default": "http://127.0.0.1:3000"
+    "description": "Netease-CDN-Bypass 服务地址（默认端口 3002，例如 http://127.0.0.1:3002）",
+    "default": "https://meting.binbim.top:3002"
   },
   "quality": {
     "type": "string",
     "label": "音质",
-    "description": "播放音质（lossless 无损 / exhigh 极高 / higher 高 / standard 标准）",
-    "enum": ["lossless", "exhigh", "higher", "standard"],
+    "description": "lossless 无损 / exhigh 极高 / higher 高 / standard 标准",
+    "options": ["lossless", "exhigh", "higher", "standard"],
     "default": "exhigh"
+  },
+  "search_limit": {
+    "type": "int",
+    "label": "搜索结果数量",
+    "description": "每次搜索展示的歌曲数量",
+    "default": 5
   }
 }

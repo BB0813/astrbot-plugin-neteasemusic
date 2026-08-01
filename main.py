@@ -1,320 +1,581 @@
 """
 Netease Music Enhanced Plugin for AstrBot
-- Author: NachoCrazy
-- Repo: https://github.com/NachoCrazy/netease-music-astrbot-plugin
-- Features: Interactive song selection, cover display, audio playback, and auto quality fallback.
+- Author: BB0813 (based on NachoCrazy)
+- Repo: https://github.com/bb0813/astrbot-plugin-neteasemusic
+- Backend: Netease-CDN-Bypass
+- QQ Official: download audio -> File(file_type=4) / Record(silk) via AstrBot adapter
+- Third-party: Record voice
 """
 
+from __future__ import annotations
+
+import asyncio
+import base64
 import os
 import re
-import time
-import base64
-import aiohttp
-import asyncio
 import shutil
 import subprocess
+import tempfile
+import time
 import urllib.parse
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 
-from astrbot.api import star, logger
+import aiohttp
+
+from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File, Image, Plain, Record
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.api.message_components import Plain, Image, Record
+
+# ---------------------------------------------------------------------------
+# 诊断日志（便于排查：消息是否到达插件、搜索是否成功、发送走哪条分支）
+# ---------------------------------------------------------------------------
+def _log(msg: str, level: str = "info"):
+    """Unified plugin log line with a fixed prefix so we can grep it in logs."""
+    text = f"[NeteaseMusicPlugin] {msg}"
+    getattr(logger, level)(text)
+    # 同时打到 stdout，保证一定可见
+    print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
 
 
-# --- Helpers ---
 def _find_ffmpeg() -> Optional[str]:
-    """
-    Try to locate the ffmpeg executable.
-    Returns the absolute path or None.
-    """
-    # 1. Standard PATH lookup
     path = shutil.which("ffmpeg")
     if path:
         return path
-
-    # 2. Common Windows install locations
     candidates = [
         r"C:\ffmpeg\bin\ffmpeg.exe",
         r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
         r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
         r"C:\Users\Administrator\ffmpeg\bin\ffmpeg.exe",
         r"C:\Windows\ffmpeg\bin\ffmpeg.exe",
+        os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"),
     ]
-    # Also try the current working directory / project root
-    candidates.append(os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"))
-
     for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate
-
-    # 3. Fallback: try subprocess to resolve via the shell
     try:
-        proc = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            timeout=5,
-        )
+        proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
         if proc.returncode == 0:
-            # It worked; the binary is somewhere in the system PATH
-            # but not visible to shutil.which in this context.
-            # Return "ffmpeg" so that subsequent subprocess calls still work
             return "ffmpeg"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-
     return None
 
 
-# --- API Wrapper ---
+def _normalize_message(text: str) -> str:
+    """Strip @mentions / leading slashes so command matching works everywhere."""
+    if not text:
+        return ""
+    text = re.sub(r"@\S+\s*", "", text)
+    text = re.sub(r"^[/／!\s]+", "", text)
+    return text.strip()
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "song"
+    return name[:80]
+
+
 class NeteaseMusicAPI:
-    """
-    A wrapper for the NeteaseCloudMusicApi to simplify interactions.
-    Encapsulates API calls for searching, getting details, and fetching audio URLs.
-    """
+    """Wrapper for Netease-CDN-Bypass."""
+
     def __init__(self, api_url: str, session: aiohttp.ClientSession):
         self.base_url = api_url.rstrip("/")
         self.session = session
 
     async def search_songs(self, keyword: str, limit: int) -> List[Dict[str, Any]]:
-        """Search for songs by keyword."""
-        url = f"{self.base_url}/search?keywords={urllib.parse.quote(keyword)}&limit={limit}&type=1"
+        url = (
+            f"{self.base_url}/search"
+            f"?keywords={urllib.parse.quote(keyword)}&limit={limit}&type=1"
+        )
         async with self.session.get(url) as r:
             r.raise_for_status()
-            data = await r.json()
-            return data.get("result", {}).get("songs", [])
+            data = await r.json(content_type=None)
+
+        raw_songs = data.get("result", {}).get("songs") or data.get("songs") or []
+        normalized: List[Dict[str, Any]] = []
+        for song in raw_songs:
+            artists = song.get("artists") or song.get("ar") or []
+            album = song.get("album") or song.get("al") or {}
+            duration = song.get("duration")
+            if duration is None:
+                duration = song.get("dt", 0)
+            if not isinstance(album, dict):
+                album = {"name": str(album)}
+            normalized.append(
+                {
+                    "id": song.get("id"),
+                    "name": song.get("name", "未知歌曲"),
+                    "artists": artists if isinstance(artists, list) else [],
+                    "album": album,
+                    "duration": duration or 0,
+                    "fee": song.get("fee", 0),
+                }
+            )
+        return normalized
 
     async def get_song_details(self, song_id: int) -> Optional[Dict[str, Any]]:
-        """Get detailed information for a single song."""
-        url = f"{self.base_url}/song/detail?ids={str(song_id)}"
+        url = f"{self.base_url}/song/detail?ids={song_id}"
         async with self.session.get(url) as r:
             r.raise_for_status()
-            data = await r.json()
-            return data["songs"][0] if data.get("songs") else None
+            data = await r.json(content_type=None)
+        songs = data.get("songs") or data.get("data") or []
+        return songs[0] if songs else None
 
-    # 此处增加了 cookie 参数，但默认值为空，不影响原逻辑
-    async def get_audio_url(self, song_id: int, quality: str) -> Optional[str]:
-        """
-        Get the audio stream URL for a song using Netease-CDN-Bypass /song/proxy.
-        This is the recommended playback endpoint.
-        """
+    def build_proxy_url(self, song_id: int, quality: str) -> str:
+        """CDN Bypass multiplies br by 1000, so pass kbps (320/192/128)."""
         br = self._quality_to_br(quality)
-        # /song/proxy streams the audio directly (bypasses hotlink protection)
-        url = f"{self.base_url}/song/proxy?id={song_id}&br={br}"
-        return url
+        return f"{self.base_url}/song/proxy?id={song_id}&br={br}"
 
-    def _quality_display(self, quality: str) -> str:
-        """Convert quality code to Chinese display name"""
-        mapping = {
-            "lossless": "无损",
-            "exhigh": "极高",
-            "higher": "高",
-            "standard": "标准",
-        }
-        return mapping.get(quality.lower(), quality)
+    def build_outer_proxy_url(self, song_id: int) -> str:
+        """Fallback: route Netease's public outer-play URL through /proxy."""
+        outer = f"https://music.163.com/song/media/outer/url?id={song_id}.mp3"
+        return f"{self.base_url}/proxy?url={urllib.parse.quote(outer, safe='')}"
+
+    def _quality_to_br(self, quality: str) -> int:
+        mapping = {"lossless": 999, "exhigh": 320, "higher": 192, "standard": 128}
+        return mapping.get(quality.lower(), 320)
+
+    async def _fetch_audio_to_file(self, url: str, path: str) -> bool:
+        """Download one audio URL to path. Returns True on success."""
+        try:
+            async with self.session.get(url) as r:
+                if r.status != 200:
+                    _log(f"audio HTTP {r.status} for {url}", "warning")
+                    return False
+
+                content_type = (r.headers.get("Content-Type") or "").lower()
+                if "json" in content_type or "text/html" in content_type:
+                    body = await r.text()
+                    _log(f"non-audio response: {body[:160]}", "warning")
+                    return False
+
+                with open(path, "wb") as f:
+                    async for chunk in r.content.iter_chunked(64 * 1024):
+                        f.write(chunk)
+        except Exception as e:
+            _log(f"fetch audio failed: {e!s}", "warning")
+            return False
+
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if size < 10240:  # 小于 10KB 基本是错误页/试听残片
+            _log(f"audio too small ({size} bytes)", "warning")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return False
+
+        _log(f"audio saved {path} ({size} bytes)")
+        return True
+
+    async def download_audio(self, song_id: int, quality: str) -> Optional[str]:
+        """
+        Download audio to a local temp mp3, trying multiple sources:
+        1. /song/proxy at requested quality
+        2. /song/proxy at lower bitrates (VIP songs sometimes allow lower)
+        3. /proxy with Netease public outer-play URL
+        Local file is required for QQ Official upload (base64 file_data).
+        """
+        tmp_dir = tempfile.gettempdir()
+        path = os.path.join(tmp_dir, f"netease_{song_id}_{int(time.time() * 1000)}.mp3")
+
+        # 依次降级尝试的码率
+        primary = self._quality_to_br(quality)
+        candidates = [primary] + [b for b in (320, 192, 128) if b != primary]
+
+        for br in candidates:
+            url = f"{self.base_url}/song/proxy?id={song_id}&br={br}"
+            _log(f"try /song/proxy br={br}")
+            if await self._fetch_audio_to_file(url, path):
+                return path
+
+        # 最后回退：网易公开外链走 /proxy 转发
+        outer_url = self.build_outer_proxy_url(song_id)
+        _log("try /proxy with outer url")
+        if await self._fetch_audio_to_file(outer_url, path):
+            return path
+
+        _log(f"all audio sources failed for {song_id}", "error")
+        return None
 
     async def download_image(self, url: str) -> Optional[bytes]:
-        """Download image data from a URL."""
         if not url:
             return None
-        async with self.session.get(url) as r:
-            if r.status == 200:
-                return await r.read()
+        try:
+            async with self.session.get(url) as r:
+                if r.status == 200:
+                    return await r.read()
+        except Exception as e:
+            _log(f"cover download failed: {e!s}", "warning")
         return None
 
 
-# --- Main Plugin Class ---
 class Main(star.Star):
-    """
-    A cat-maid themed Netease Music plugin that allows users to search for,
-    select, and play songs directly in the chat.
-    """
     def __init__(self, context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
         self.config = config or {}
-        self.config.setdefault("api_url", "http://127.0.0.1:3000")
+        self.config.setdefault("api_url", "https://meting.binbim.top:3002")
         self.config.setdefault("quality", "exhigh")
-        # cookie 配置已移除，不再需要
-        
+        self.config.setdefault("search_limit", 5)
+
         self.waiting_users: Dict[str, Dict[str, Any]] = {}
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
-        
-        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+        self._temp_files: List[str] = []
+
+        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
         self.api = NeteaseMusicAPI(self.config["api_url"], self.http_session)
-        
-        # Ensure ffmpeg is discoverable for Record components
+
         self._ffmpeg_path = _find_ffmpeg()
         if self._ffmpeg_path:
             ffmpeg_dir = os.path.dirname(self._ffmpeg_path)
             current_path = os.environ.get("PATH", "")
-            if ffmpeg_dir not in current_path:
+            if ffmpeg_dir and ffmpeg_dir not in current_path:
                 os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
-                logger.info(f"Netease Music plugin: Added ffmpeg directory to PATH: {ffmpeg_dir}")
+                _log(f"Added ffmpeg to PATH: {ffmpeg_dir}")
         else:
-            logger.warning("Netease Music plugin: ffmpeg not found in PATH. Record (voice) may fail.")
-        
-        self.cleanup_task: Optional[asyncio.Task] = None
+            _log("ffmpeg not found. silk/Record may fail.", "warning")
 
-    # --- Lifecycle Hooks ---
+        self.cleanup_task: Optional[asyncio.Task] = None
+        _log(
+            f"initialized. api_url={self.config['api_url']}, quality={self.config['quality']}"
+        )
 
     async def initialize(self):
-        """Starts the background cleanup task when the plugin is activated."""
         self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        logger.info("Netease Music plugin: Background cleanup task started.")
+        _log("Background cleanup task started.")
 
     async def terminate(self):
-        """Cleans up resources when the plugin is unloaded."""
         if self.cleanup_task and not self.cleanup_task.done():
             self.cleanup_task.cancel()
             try:
                 await self.cleanup_task
             except asyncio.CancelledError:
-                logger.info("Netease Music plugin: Background cleanup task cancelled.")
-        
+                _log("Background cleanup task cancelled.")
+        self._cleanup_temp_files(force=True)
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
-            logger.info("Netease Music plugin: HTTP session closed.")
+            _log("HTTP session closed.")
 
     async def _periodic_cleanup(self):
-        """A background task that runs periodically to clean up expired sessions."""
         while True:
-            await asyncio.sleep(60)  # Run every 60 seconds
+            await asyncio.sleep(60)
             now = time.time()
-            expired_sessions = []
-            
-            for session_id, user_session in self.waiting_users.items():
-                if user_session['expire'] < now:
-                    expired_sessions.append((session_id, user_session['key']))
-            
-            if expired_sessions:
-                logger.info(f"Netease Music plugin: Cleaning up {len(expired_sessions)} expired session(s).")
-                for session_id, cache_key in expired_sessions:
-                    if session_id in self.waiting_users:
-                        del self.waiting_users[session_id]
-                    if cache_key in self.song_cache:
-                        del self.song_cache[cache_key]
+            expired = [
+                (sid, s["key"])
+                for sid, s in self.waiting_users.items()
+                if s["expire"] < now
+            ]
+            for sid, key in expired:
+                self.waiting_users.pop(sid, None)
+                self.song_cache.pop(key, None)
+            self._cleanup_temp_files()
 
-    # --- Event Handlers ---
+    def _track_temp(self, path: str):
+        if path and path not in self._temp_files:
+            self._temp_files.append(path)
+
+    def _cleanup_temp_files(self, force: bool = False):
+        remain = []
+        now = time.time()
+        for path in self._temp_files:
+            try:
+                if not os.path.exists(path):
+                    continue
+                age = now - os.path.getmtime(path)
+                if force or age > 300:
+                    os.remove(path)
+                else:
+                    remain.append(path)
+            except OSError:
+                remain.append(path)
+        self._temp_files = remain
+
+    # --- Handlers ---
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1)
+    async def _probe_all_messages(self, event: AstrMessageEvent):
+        """诊断探针：确认插件是否能收到事件。不拦截、不回复。"""
+        try:
+            raw = event.message_str or ""
+            _log(
+                f"PROBE msg='{raw}' platform={self._platform_name(event)} "
+                f"session={event.get_session_id()} "
+                f"is_wake={getattr(event, 'is_at_or_wake_command', None)} "
+                f"chain={[type(c).__name__ for c in (event.get_messages() or [])]}"
+            )
+        except Exception as e:
+            _log(f"PROBE error: {e!s}", "error")
 
     @filter.command("点歌", alias={"music", "听歌", "网易云"})
     async def cmd_handler(self, event: AstrMessageEvent, keyword: str = ""):
-        """Handles the '/点歌' command."""
-        if not keyword.strip():
-            await event.send(MessageChain([Plain("主人，请告诉我您想听什么歌喵~ 例如：/点歌 Lemon")]))
-            return
-        await self.search_and_show(event, keyword.strip())
+        raw = event.message_str or ""
+        _log(
+            f"cmd_handler fired. raw='{raw}', keyword='{keyword}', "
+            f"platform={self._platform_name(event)}, session={event.get_session_id()}"
+        )
+        keyword = _normalize_message(keyword or "")
+        if not keyword:
+            text = _normalize_message(raw)
+            m = re.match(r"^(?:点歌|music|听歌|网易云)\s*(.+)$", text, re.I)
+            keyword = m.group(1).strip() if m else ""
 
-    @filter.regex(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$")
+        if not keyword:
+            await event.send(
+                MessageChain([Plain("主人，请告诉我您想听什么歌喵~ 例如：/点歌 Lemon")])
+            )
+            event.stop_event()
+            return
+        await self.search_and_show(event, keyword)
+        # 阻止 natural_language_handler 对同一条消息重复响应
+        event.stop_event()
+
+    @filter.regex(r"(?i)(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首|music|听歌|网易云)\s*.+")
     async def natural_language_handler(self, event: AstrMessageEvent):
-        """Handles song requests in natural language."""
-        match = re.search(r"(?i)^(来.?一首|播放|听.?听|点歌|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$", event.message_str)
+        text = _normalize_message(event.message_str or "")
+        _log(
+            f"natural_language_handler fired. text='{text}', "
+            f"platform={self._platform_name(event)}"
+        )
+        match = re.search(
+            r"(?i)(?:来.?一首|播放|听.?听|点歌|唱.?一首|来.?首|music|听歌|网易云)\s*(.+?)(?:的歌|的歌曲|的音乐|歌|曲)?$",
+            text,
+        )
         if match:
-            keyword = match.group(2).strip()
+            keyword = match.group(1).strip()
             if keyword:
                 event.stop_event()
                 await self.search_and_show(event, keyword)
 
     @filter.regex(r"^\d+$", priority=999)
     async def number_selection_handler(self, event: AstrMessageEvent):
-        """Handles user's numeric choice from the search results."""
         session_id = event.get_session_id()
         if session_id not in self.waiting_users:
             return
-
         user_session = self.waiting_users[session_id]
         if time.time() > user_session["expire"]:
-            # Let the periodic cleanup handle the removal
             return
-
         try:
-            num = int(event.message_str.strip())
+            num = int((event.message_str or "").strip())
         except ValueError:
             return
-
-        limit = self.config.get("search_limit", 5)
+        limit = int(self.config.get("search_limit", 5))
         if not (1 <= num <= limit):
             return
-
         event.stop_event()
-
-        # Fix: 先清掉 waiting_users，防止平台重试/重复事件导致重复发消息
         del self.waiting_users[session_id]
-
+        _log(f"number_selection_handler: chose #{num}, session={session_id}")
         await self.play_selected_song(event, user_session["key"], num)
 
-    # --- Core Logic ---
+    # --- Core ---
+
+    def _platform_name(self, event: AstrMessageEvent) -> str:
+        try:
+            return event.get_platform_name() or "?"
+        except Exception:
+            return "?"
 
     async def search_and_show(self, event: AstrMessageEvent, keyword: str):
-        """Searches for songs and displays the results to the user."""
+        _log(
+            f"search_and_show: keyword='{keyword}' via {self.config['api_url']}"
+        )
         try:
-            songs = await self.api.search_songs(keyword, self.config.get("search_limit", 5))
+            songs = await self.api.search_songs(
+                keyword, int(self.config.get("search_limit", 5))
+            )
+            _log(f"search returned {len(songs)} songs")
         except Exception as e:
-            logger.error(f"Netease Music plugin: API search failed. Error: {e!s}")
-            await event.send(MessageChain([Plain(f"呜喵...和音乐服务器的连接断掉了...主人，请检查一下API服务是否正常运行喵？")]))
+            _log(f"search failed: {e!s}", "error")
+            try:
+                await event.send(
+                    MessageChain(
+                        [
+                            Plain(
+                                "呜喵...和音乐服务器的连接断掉了...\n"
+                                f"当前 API：{self.config.get('api_url')}\n"
+                                "请确认 Netease-CDN-Bypass 已启动"
+                            )
+                        ]
+                    )
+                )
+            except Exception as e2:
+                _log(f"send error msg failed: {e2!s}", "error")
             return
 
         if not songs:
-            await event.send(MessageChain([Plain(f"对不起主人...我...我没能找到「{keyword}」这首歌喵... T_T")]))
+            _log("no songs found")
+            try:
+                await event.send(
+                    MessageChain(
+                        [Plain(f"对不起主人...没能找到「{keyword}」这首歌喵... T_T")]
+                    )
+                )
+            except Exception as e2:
+                _log(f"send no-result failed: {e2!s}", "error")
             return
 
         cache_key = f"{event.get_session_id()}_{int(time.time())}"
         self.song_cache[cache_key] = songs
 
-        response_lines = [f"主人，我为您找到了 {len(songs)} 首歌曲喵！请回复数字告诉我您想听哪一首~"]
+        lines = [f"主人，我为您找到了 {len(songs)} 首歌曲喵！请回复数字告诉我您想听哪一首~"]
         for i, song in enumerate(songs, 1):
-            artists = " / ".join(a["name"] for a in song.get("artists", []))
-            album = song.get("album", {}).get("name", "未知专辑")
-            duration_ms = song.get("duration", 0)
-            dur_str = f"{duration_ms//60000}:{(duration_ms%60000)//1000:02d}"
-            response_lines.append(f"{i}. {song['name']} - {artists} 《{album}》 [{dur_str}]")
+            artists = " / ".join(
+                a.get("name", "") for a in song.get("artists", []) if isinstance(a, dict)
+            ) or "未知歌手"
+            album = (
+                song.get("album", {}).get("name", "未知专辑")
+                if isinstance(song.get("album"), dict)
+                else "未知专辑"
+            )
+            duration_ms = int(song.get("duration", 0) or 0)
+            dur = f"{duration_ms // 60000}:{(duration_ms % 60000) // 1000:02d}"
+            lines.append(f"{i}. {song.get('name', '未知')} - {artists} 《{album}》 [{dur}]")
 
-        await event.send(MessageChain([Plain("\n".join(response_lines))]))
+        try:
+            await event.send(MessageChain([Plain("\n".join(lines))]))
+            _log("search list sent")
+        except Exception as e:
+            _log(f"send search list failed: {e!s}", "error")
 
-        self.waiting_users[event.get_session_id()] = {"key": cache_key, "expire": time.time() + 60}
+        self.waiting_users[event.get_session_id()] = {
+            "key": cache_key,
+            "expire": time.time() + 60,
+        }
+        _log(f"showed {len(songs)} results")
 
     async def play_selected_song(self, event: AstrMessageEvent, cache_key: str, num: int):
-        """Plays the song selected by the user."""
-        if cache_key not in self.song_cache:
-            await event.send(MessageChain([Plain("喵呜~ 主人选择得太久了，搜索结果已经凉掉了哦，请重新点歌吧~")]))
+        songs = self.song_cache.get(cache_key)
+        if not songs:
+            await event.send(MessageChain([Plain("喵呜~ 选择超时了，请重新点歌吧~")]))
+            return
+        if not (1 <= num <= len(songs)):
+            await event.send(MessageChain([Plain("主人，请选择列表里的歌曲编号喵~")]))
             return
 
-        songs = self.song_cache[cache_key]
-        if not (1 <= num <= len(songs)):
-             await event.send(MessageChain([Plain("主人，您输入的数字不对哦，请选择列表里的歌曲编号喵~")]))
-             return
-             
-        selected_song = songs[num - 1]
-        song_id = selected_song["id"]
-        
-        try:
-            # Use Netease-CDN-Bypass /song/proxy endpoint (streams audio directly)
-            song_details = await self.api.get_song_details(song_id)
-            if not song_details:
-                raise ValueError("无法获取歌曲详细信息。")
+        selected = songs[num - 1]
+        song_id = selected["id"]
+        _log(f"play_selected_song: song_id={song_id}, name={selected.get('name')}")
 
-            audio_url = await self.api.get_audio_url(song_id, self.config["quality"])
-            if not audio_url:
-                await event.send(MessageChain([Plain(f"喵~ 这首歌可能需要VIP或者没有版权，暂时不能为主人播放呢...")]))
+        try:
+            details = await self.api.get_song_details(song_id)
+            if details:
+                title = details.get("name", selected.get("name", ""))
+                artists = " / ".join(
+                    a.get("name", "")
+                    for a in (details.get("ar") or details.get("artists") or [])
+                    if isinstance(a, dict)
+                )
+                al = details.get("al") or details.get("album") or {}
+                album = al.get("name", "未知专辑") if isinstance(al, dict) else "未知专辑"
+                cover_url = al.get("picUrl", "") if isinstance(al, dict) else ""
+                duration_ms = int(
+                    details.get("dt")
+                    or details.get("duration")
+                    or selected.get("duration")
+                    or 0
+                )
+            else:
+                title = selected.get("name", "")
+                artists = " / ".join(
+                    a.get("name", "")
+                    for a in selected.get("artists", [])
+                    if isinstance(a, dict)
+                )
+                album = "未知专辑"
+                cover_url = ""
+                duration_ms = int(selected.get("duration", 0))
+
+            if not artists:
+                artists = "未知歌手"
+
+            # Download audio locally first (critical for QQ Official upload)
+            audio_path = await self.api.download_audio(song_id, self.config["quality"])
+            if not audio_path:
+                _log(f"audio download returned None for {song_id}", "error")
+                try:
+                    await event.send(
+                        MessageChain(
+                            [
+                                Plain(
+                                    f"喵~ 《{title}》暂时播放不了呢...\n"
+                                    "这首歌可能是 VIP / 无版权曲目。\n"
+                                    "如需播放 VIP 歌曲，请在 Netease-CDN-Bypass 的 .env 中配置 NETEASE_COOKIE 并重启服务喵~"
+                                )
+                            ]
+                        )
+                    )
+                except Exception as e2:
+                    _log(f"send download-fail msg failed: {e2!s}", "error")
                 return
 
-            title = song_details.get("name", "")
-            artists = " / ".join(a["name"] for a in song_details.get("ar", []))
-            album = song_details.get("al", {}).get("name", "未知专辑")
-            cover_url = song_details.get("al", {}).get("picUrl", "")
-            duration_ms = song_details.get("dt", 0)
-            dur_str = f"{duration_ms//60000}:{(duration_ms%60000)//1000:02d}"
-
-            await self._send_song_messages(event, num, title, artists, album, dur_str, cover_url, audio_url)
-
+            self._track_temp(audio_path)
+            dur = f"{duration_ms // 60000}:{(duration_ms % 60000) // 1000:02d}"
+            await self._send_song_messages(
+                event,
+                num=num,
+                title=title,
+                artists=artists,
+                album=album,
+                dur_str=dur,
+                cover_url=cover_url,
+                audio_path=audio_path,
+            )
         except Exception as e:
-            logger.error(f"Netease Music plugin: Failed to play song {song_id}. Error: {e!s}")
-            await event.send(MessageChain([Plain(f"呜...获取歌曲信息的时候失败了喵...")]))
-        finally:
-            if cache_key in self.song_cache:
-                del self.song_cache[cache_key]
+            _log(f"play_selected_song exception: {e!s}", "error")
+            import traceback
 
-    async def _send_song_messages(self, event: AstrMessageEvent, num: int, title: str, artists: str, album: str, dur_str: str, cover_url: str, audio_url: str):
-        """Constructs and sends the song info and audio messages."""
+            traceback.print_exc()
+            try:
+                await event.send(MessageChain([Plain("呜...发送失败了喵...")]))
+            except Exception as e2:
+                _log(f"send fail msg failed: {e2!s}", "error")
+        finally:
+            self.song_cache.pop(cache_key, None)
+
+    def _quality_display(self, quality: str) -> str:
+        return {
+            "lossless": "无损",
+            "exhigh": "极高",
+            "higher": "高",
+            "standard": "标准",
+        }.get(quality.lower(), quality)
+
+    def _is_official_qq(self, event: AstrMessageEvent) -> bool:
+        bits = []
+        for getter in (
+            lambda: event.get_platform_name(),
+            lambda: getattr(event, "get_platform_id", lambda: "")(),
+            lambda: getattr(getattr(event, "platform_meta", None), "name", ""),
+            lambda: getattr(getattr(event, "platform_meta", None), "type", ""),
+            lambda: event.get_session_id(),
+        ):
+            try:
+                bits.append(str(getter() or ""))
+            except Exception:
+                pass
+        blob = " ".join(bits).lower()
+        return any(
+            k in blob
+            for k in (
+                "qq_official",
+                "qqofficial",
+                "official_webhook",
+                "官机",
+                "qqbot",
+            )
+        )
+
+    async def _send_song_messages(
+        self,
+        event: AstrMessageEvent,
+        num: int,
+        title: str,
+        artists: str,
+        album: str,
+        dur_str: str,
+        cover_url: str,
+        audio_path: str,
+    ):
         detail_text = f"""遵命，主人！为您播放第 {num} 首歌曲~
 
 ♪ 歌名：{title}
@@ -325,22 +586,66 @@ class Main(star.Star):
 
 请主人享用喵~
 """
-        info_components = [Plain(detail_text)]
+        info = [Plain(detail_text)]
 
         image_data = await self.api.download_image(cover_url)
         if image_data:
-            info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
+            info.append(Image.fromBase64(base64.b64encode(image_data).decode()))
 
-        await event.send(MessageChain(info_components))
-        
-        # Try to send as a voice message (Record component)
         try:
-            await event.send(MessageChain([Record(file=audio_url)]))
+            await event.send(MessageChain(info))
+            _log("info card sent")
         except Exception as e:
-            err_msg = str(e)
-            if "ffmpeg" in err_msg.lower() or "not found" in err_msg.lower():
-                # Fallback if ffmpeg is still unavailable after PATH fix attempt
-                logger.warning(f"Netease Music plugin: Record(voice) failed, falling back to link. Error: {err_msg}")
-                await event.send(MessageChain([Plain(f"🔊 点击播放：{audio_url}")]))
-            else:
-                raise
+            _log(f"send info card failed: {e!s}", "error")
+
+        filename = f"{_safe_filename(title)}.mp3"
+        is_official = self._is_official_qq(event)
+        _log(f"send audio: official={is_official}, file={audio_path}")
+
+        # QQ Official flow: File card (file_type=4) first, then Record, then link
+        if is_official:
+            sent = False
+
+            try:
+                await event.send(MessageChain([File(name=filename, file=audio_path)]))
+                _log("official File card sent")
+                sent = True
+            except Exception as e:
+                _log(f"official File failed: {e!s}", "warning")
+
+            if not sent:
+                try:
+                    await event.send(MessageChain([Record(file=audio_path)]))
+                    _log("official Record sent")
+                    sent = True
+                except Exception as e:
+                    _log(f"official Record failed: {e!s}", "warning")
+
+            if not sent:
+                try:
+                    await event.send(
+                        MessageChain([Plain("官方机器人富媒体发送失败了喵~ 请稍后再试")])
+                    )
+                except Exception as e2:
+                    _log(f"send fallback text failed: {e2!s}", "error")
+            return
+
+        # Third-party bots: prefer Record voice
+        try:
+            await event.send(MessageChain([Record(file=audio_path)]))
+            _log("third-party Record sent")
+            return
+        except Exception as e:
+            _log(f"Record failed: {e!s}", "warning")
+
+        try:
+            await event.send(MessageChain([File(name=filename, file=audio_path)]))
+            _log("third-party File sent")
+            return
+        except Exception as e:
+            _log(f"File failed: {e!s}", "warning")
+
+        try:
+            await event.send(MessageChain([Plain("发送音频失败了喵~ 请稍后再试")]))
+        except Exception as e:
+            _log(f"send fallback failed: {e!s}", "error")
