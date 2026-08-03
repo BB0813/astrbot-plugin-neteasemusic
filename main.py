@@ -623,24 +623,24 @@ class Main(star.Star):
         is_official = self._is_official_qq(event)
         _log(f"send audio: official={is_official}, file={audio_path}")
 
-        # QQ Official flow: File card (file_type=4) first, then Record, then link
+        # QQ Official flow: Record voice (inline play) first, then File card, then link
         if is_official:
             sent = False
 
             try:
-                await event.send(MessageChain([File(name=filename, file=audio_path)]))
-                _log("official File card sent")
+                await event.send(MessageChain([Record(file=audio_path)]))
+                _log("official Record sent (inline play)")
                 sent = True
             except Exception as e:
-                _log(f"official File failed: {e!s}", "warning")
+                _log(f"official Record failed: {e!s}", "warning")
 
             if not sent:
                 try:
-                    await event.send(MessageChain([Record(file=audio_path)]))
-                    _log("official Record sent")
+                    await event.send(MessageChain([File(name=filename, file=audio_path)]))
+                    _log("official File card sent (download)")
                     sent = True
                 except Exception as e:
-                    _log(f"official Record failed: {e!s}", "warning")
+                    _log(f"official File failed: {e!s}", "warning")
 
             if not sent:
                 try:
