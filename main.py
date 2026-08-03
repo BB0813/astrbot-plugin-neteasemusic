@@ -122,30 +122,54 @@ class NeteaseMusicAPI:
         songs = data.get("songs") or data.get("data") or []
         return songs[0] if songs else None
 
-    def build_proxy_url(self, song_id: int, quality: str) -> str:
-        """CDN Bypass multiplies br by 1000, so pass kbps (320/192/128)."""
-        br = self._quality_to_br(quality)
-        return f"{self.base_url}/song/proxy?id={song_id}&br={br}"
-
-    def build_outer_proxy_url(self, song_id: int) -> str:
-        """Fallback: route Netease's public outer-play URL through /proxy."""
-        outer = f"https://music.163.com/song/media/outer/url?id={song_id}.mp3"
-        return f"{self.base_url}/proxy?url={urllib.parse.quote(outer, safe='')}"
-
     def _quality_to_br(self, quality: str) -> int:
+        """Netease-CDN-Bypass 文档：br 为 128/192/320/999（服务端会 *1000）。"""
         mapping = {"lossless": 999, "exhigh": 320, "higher": 192, "standard": 128}
         return mapping.get(quality.lower(), 320)
 
+    def build_proxy_url(self, song_id: int, quality: str) -> str:
+        """推荐端点：/song/proxy 直接返回音频流。"""
+        br = self._quality_to_br(quality)
+        return f"{self.base_url}/song/proxy?id={song_id}&br={br}"
+
+    def _via_proxy(self, raw_url: str) -> str:
+        """通用代理：把任意 CDN/外链 URL 走 /proxy 转发（绕过防盗链）。"""
+        return f"{self.base_url}/proxy?url={urllib.parse.quote(raw_url, safe='')}"
+
+    async def get_play_url(self, song_id: int, br: int) -> Optional[str]:
+        """
+        代理请求链第 1 步：GET /song/url 拿到网易 CDN 真实地址。
+        返回 data[0].url，失败返回 None。
+        """
+        url = f"{self.base_url}/song/url?id={song_id}&br={br}"
+        try:
+            async with self.session.get(url) as r:
+                r.raise_for_status()
+                data = await r.json(content_type=None)
+            items = data.get("data") or []
+            if not items:
+                _log(f"/song/url empty data for {song_id}", "warning")
+                return None
+            item = items[0] or {}
+            play_url = item.get("url")
+            code = item.get("code")
+            _log(f"/song/url id={song_id} br={br} code={code} has_url={bool(play_url)}")
+            return play_url or None
+        except Exception as e:
+            _log(f"/song/url failed: {e!s}", "warning")
+            return None
+
     async def _fetch_audio_to_file(self, url: str, path: str) -> bool:
-        """Download one audio URL to path. Returns True on success."""
+        """下载音频到本地文件。成功返回 True。"""
         try:
             async with self.session.get(url) as r:
                 if r.status != 200:
-                    _log(f"audio HTTP {r.status} for {url}", "warning")
+                    _log(f"audio HTTP {r.status} for {url[:120]}", "warning")
                     return False
 
                 content_type = (r.headers.get("Content-Type") or "").lower()
-                if "json" in content_type or "text/html" in content_type:
+                # VIP 失败时 /song/proxy 会回 JSON；外链失败时可能回 HTML
+                if "json" in content_type or "text/html" in content_type or "text/plain" in content_type:
                     body = await r.text()
                     _log(f"non-audio response: {body[:160]}", "warning")
                     return False
@@ -158,7 +182,7 @@ class NeteaseMusicAPI:
             return False
 
         size = os.path.getsize(path) if os.path.exists(path) else 0
-        if size < 10240:  # 小于 10KB 基本是错误页/试听残片
+        if size < 10240:  # <10KB 基本是错误页/残片
             _log(f"audio too small ({size} bytes)", "warning")
             try:
                 os.remove(path)
@@ -171,32 +195,43 @@ class NeteaseMusicAPI:
 
     async def download_audio(self, song_id: int, quality: str) -> Optional[str]:
         """
-        Download audio to a local temp mp3, trying multiple sources:
-        1. /song/proxy at requested quality
-        2. /song/proxy at lower bitrates (VIP songs sometimes allow lower)
-        3. /proxy with Netease public outer-play URL
-        Local file is required for QQ Official upload (base64 file_data).
+        按 Netease-CDN-Bypass 文档的代理请求链下载音频到本地：
+
+          1) GET /song/url?id=&br=     → 拿到 CDN 真实 URL（服务端带 Cookie）
+          2) GET /proxy?url=<cdn_url>  → 服务器代拉流，绕过防盗链
+          3) 兜底 GET /song/proxy?id=  → 服务端内部做 1+2 的一站式端点
+          4) 再兜底 outer 外链走 /proxy
+
+        本地下载是必须的：QQ 官方机器人上传富媒体要用 file_data(base64)。
         """
         tmp_dir = tempfile.gettempdir()
         path = os.path.join(tmp_dir, f"netease_{song_id}_{int(time.time() * 1000)}.mp3")
 
-        # 依次降级尝试的码率
         primary = self._quality_to_br(quality)
-        candidates = [primary] + [b for b in (320, 192, 128) if b != primary]
+        br_list = [primary] + [b for b in (320, 192, 128) if b != primary]
 
-        for br in candidates:
+        # ---- 链路 A：/song/url → /proxy（文档标准两步）----
+        for br in br_list:
+            _log(f"chain A: /song/url → /proxy br={br}")
+            play_url = await self.get_play_url(song_id, br)
+            if play_url:
+                if await self._fetch_audio_to_file(self._via_proxy(play_url), path):
+                    return path
+
+        # ---- 链路 B：一站式 /song/proxy（推荐端点）----
+        for br in br_list:
             url = f"{self.base_url}/song/proxy?id={song_id}&br={br}"
-            _log(f"try /song/proxy br={br}")
+            _log(f"chain B: /song/proxy br={br}")
             if await self._fetch_audio_to_file(url, path):
                 return path
 
-        # 最后回退：网易公开外链走 /proxy 转发
-        outer_url = self.build_outer_proxy_url(song_id)
-        _log("try /proxy with outer url")
-        if await self._fetch_audio_to_file(outer_url, path):
+        # ---- 链路 C：公开 outer 外链走 /proxy ----
+        outer = f"https://music.163.com/song/media/outer/url?id={song_id}.mp3"
+        _log("chain C: outer url via /proxy")
+        if await self._fetch_audio_to_file(self._via_proxy(outer), path):
             return path
 
-        _log(f"all audio sources failed for {song_id}", "error")
+        _log(f"all audio chains failed for {song_id}", "error")
         return None
 
     async def download_image(self, url: str) -> Optional[bytes]:
@@ -292,20 +327,6 @@ class Main(star.Star):
         self._temp_files = remain
 
     # --- Handlers ---
-
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1)
-    async def _probe_all_messages(self, event: AstrMessageEvent):
-        """诊断探针：确认插件是否能收到事件。不拦截、不回复。"""
-        try:
-            raw = event.message_str or ""
-            _log(
-                f"PROBE msg='{raw}' platform={self._platform_name(event)} "
-                f"session={event.get_session_id()} "
-                f"is_wake={getattr(event, 'is_at_or_wake_command', None)} "
-                f"chain={[type(c).__name__ for c in (event.get_messages() or [])]}"
-            )
-        except Exception as e:
-            _log(f"PROBE error: {e!s}", "error")
 
     @filter.command("点歌", alias={"music", "听歌", "网易云"})
     async def cmd_handler(self, event: AstrMessageEvent, keyword: str = ""):
