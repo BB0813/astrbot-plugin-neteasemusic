@@ -1,6 +1,6 @@
 # AstrBot 网易云音乐点歌插件-优化版
 
-[![version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/bb0813/astrbot-plugin-neteasemusic)
+[![version](https://img.shields.io/badge/version-2.2.1-blue.svg)](https://github.com/bb0813/astrbot-plugin-neteasemusic)
 [![license](https://img.shields.io/github/license/bb0813/astrbot-plugin-neteasemusic.svg)](LICENSE)
 
 这是一款为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 设计的，功能强大且体验豪华的网易云音乐点歌插件。
@@ -33,16 +33,15 @@
 
 ### 安装
 
-1. 在 AstrBot 的插件商店中搜索 `netease_music_enhanced` 并安装。
+1. 在 AstrBot 的插件商店中搜索 `astrbot_plugin_netease_music` 并安装。
 2. 或者，直接将本项目克隆到您的 AstrBot `data/plugins` 目录下。
 
 ### 配置
 
-安装并重启 AstrBot 后，在网页后台的 **插件配置** -> **`netease_music_enhanced`** 中进行设置：
+安装并重启 AstrBot 后，在网页后台的 **插件配置** -> **`astrbot_plugin_netease_music`** 中进行设置：
 
-1. **API 地址**：填写您部署的 Netease-CDN-Bypass 服务的地址（默认 `http://127.0.0.1:3002`）。
-2. **音质**：选择您希望优先播放的音质（lossless 无损 / exhigh 极高 / higher 高 / standard 标准）。
-3. **搜索结果数量**：每次搜索返回的歌曲数量。
+1. **API 地址**：填写您部署的 Netease-CDN-Bypass 服务的地址（默认 `https://meting.binbim.top`）。
+2. **音质**：选择您希望优先播放的音质（无损 / 极高 / 高 / 标准）。
 
 ## 📝 使用方法
 
