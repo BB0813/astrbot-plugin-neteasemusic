@@ -4,6 +4,6 @@ desc: "AstrBot 网易云音乐点歌插件-优化版\n\n适配 Netease-CDN-Bypas
 author: "BB0813"
 repo: "https://github.com/bb0813/astrbot-plugin-neteasemusic"
 social_link: "https://github.com/bb0813"
-version: "2.2.1"
+version: "2.2.2"
 logo: "https://s2.loli.net/2022/04/11/gO1t56sM4pQeYyH.png"
 config: true

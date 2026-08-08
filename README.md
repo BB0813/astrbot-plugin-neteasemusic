@@ -1,6 +1,6 @@
 # AstrBot 网易云音乐点歌插件-优化版
 
-[![version](https://img.shields.io/badge/version-2.2.1-blue.svg)](https://github.com/bb0813/astrbot-plugin-neteasemusic)
+[![version](https://img.shields.io/badge/version-2.2.2-blue.svg)](https://github.com/bb0813/astrbot-plugin-neteasemusic)
 [![license](https://img.shields.io/github/license/bb0813/astrbot-plugin-neteasemusic.svg)](LICENSE)
 
 这是一款为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 设计的，功能强大且体验豪华的网易云音乐点歌插件。
